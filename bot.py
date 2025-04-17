@@ -16,6 +16,8 @@ from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 import os
 import asyncio
+from db import async_session, UserData  # Подключаем сессию и модель пользователя
+
 
 # Загрузка токена из .env
 load_dotenv()
@@ -166,12 +168,31 @@ async def process_heredity(message: Message, state: FSMContext):
     await state.set_state(DataStates.clinical)
     await message.answer("Клинические проявления (симптомы, жалобы):")
 
-# Финальный шаг: вывод всех данных
+# Финальный шаг: вывод всех данных и сохранение в базу данных
 @dp.message(StateFilter(DataStates.clinical))
 async def process_clinical(message: Message, state: FSMContext):
     await state.update_data(clinical=message.text)
     data = await state.get_data()
-    username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+    
+    # Сохранение данных в базу данных
+    async with async_session() as session:
+        async with session.begin():
+            user_data = UserData(
+                telegram_id=message.from_user.id,
+                username=message.from_user.username or message.from_user.full_name,
+                full_name=message.from_user.full_name,
+                goal=data['goal'],
+                sport=data['sport'],
+                smoking=data['smoking'],
+                alcohol=data['alcohol'],
+                diseases=data['chronic'],
+                heredity=data['heredity'],
+                symptoms=data['clinical']
+            )
+            session.add(user_data)
+        await session.commit()
+
+    # Вывод данных пользователю
     summary = (
         f"<b>Вот введённые вами данные:</b>\n"
         f"👤 ФИО: {data['fio']}\n"
@@ -182,7 +203,6 @@ async def process_clinical(message: Message, state: FSMContext):
         f"💉 Хронические болезни: {data['chronic']}\n"
         f"🧬 Наследственная предрасположенность: {data['heredity']}\n"
         f"🩺 Клинические проявления: {data['clinical']}\n"
-        f"👤 Ваш аккаунт: {username}\n"
     )
     await message.answer(summary, reply_markup=main_keyboard)
     await state.clear()
