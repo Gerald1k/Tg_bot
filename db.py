@@ -1,8 +1,9 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Text
+from sqlalchemy import Column, Integer, String, Text, Float  # добавлен Float
 from os import getenv
 from dotenv import load_dotenv
+import asyncio
 
 load_dotenv()
 
@@ -30,8 +31,27 @@ class UserData(Base):
     full_name = Column(String(255))
     goal = Column(String(100))
     sport = Column(String(50))
+    height = Column(Integer, nullable=True)   # рост в сантиметрах
+    weight = Column(Float,   nullable=True)   # вес в килограммах
     smoking = Column(String(10))
     alcohol = Column(String(10))
     diseases = Column(Text)
     heredity = Column(Text)
     symptoms = Column(Text)
+
+
+# Функция для сброса и создания таблиц
+async def init_db():
+    async with engine.begin() as conn:
+        # Удаляем все таблицы
+        await conn.run_sync(Base.metadata.drop_all)
+        # Создаем все таблицы по текущим моделям
+        await conn.run_sync(Base.metadata.create_all)
+
+# Инициализация БД при запуске файла
+if __name__ == "__main__":
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(init_db())
+    loop.close()
+
