@@ -33,7 +33,7 @@ dp = Dispatcher(storage=MemoryStorage())
 # Клавиатура главного меню
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📝 Заполнение данных")],
+        [KeyboardButton(text="📝 Данные пользователя")],
         [KeyboardButton(text="🍽 Рекомендации по КБЖУ")],
         [KeyboardButton(text="🧪 Добавить анализ")],
         [KeyboardButton(text="📊 Получить рекомендации")],
@@ -44,7 +44,7 @@ main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Клавиатура для подменю "Заполнение данных"
+# Клавиатура для подменю "Данные пользователя"
 fill_data_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🖊 Ввести данные")],
@@ -80,8 +80,8 @@ async def start_handler(message: Message):
         reply_markup=main_keyboard
     )
 
-# Главное меню → "Заполнение данных"
-@dp.message(F.text == "📝 Заполнение данных")
+# Главное меню → "Данные пользователя"
+@dp.message(F.text == "📝 Данные пользователя")
 async def fill_data_handler(message: Message):
     await message.answer(
         "🔒 В этом разделе вы можете ввести свои данные, отредактировать их или удалить, если это необходимо.\n\n"
@@ -449,6 +449,74 @@ async def process_delete_confirmation(message: Message, state: FSMContext):
 @dp.message(F.text == "⬅️ Назад")
 async def back_to_main_menu(message: Message):
     await message.answer("🔙 Вы вернулись в главное меню. Выберите следующее действие.", reply_markup=main_keyboard)
+
+@dp.message(F.text == "🍽 Рекомендации по КБЖУ")
+async def kbju_recommendation(message: Message):
+    # достаём из БД вес и цель пользователя
+    async with async_session() as session:
+        async with session.begin():
+            result = await session.execute(
+                select(UserData).where(UserData.telegram_id == message.from_user.id)
+            )
+            user = result.scalars().first()
+
+    if not user:
+        await message.answer(
+            "❗️ Данных не найдено. Сначала заполните профиль через 📝 Данные пользователя.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    try:
+        weight = float(user.weight)
+    except (TypeError, ValueError):
+        await message.answer(
+            "⚠️ Неверный формат веса в базе. Пожалуйста, обновите его в разделе 📝 Данные пользователя → ✏️ Редактировать данные → Вес.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    goal = user.goal
+
+    # Примитивные формулы для каждого сценария
+    if goal == "Набор мышечной массы":
+        proteins = weight * 1.5
+        fats     = weight - 10
+        carbs    = weight * 4
+        carbs2   = weight * 3
+        calories = proteins * 4 + fats * 9 + carbs * 4
+        calories2 = proteins * 4 + fats * 9 + carbs2 * 4
+        expected_change = (calories - calories2) * 30 / 7.9
+        change_text = f"Прогнозируемый прирост в месяц: {int(expected_change)} г"
+    elif goal == "Снижение веса":
+        proteins = weight * 1.5
+        fats     = weight - 10
+        carbs    = weight * 1.5
+        carbs2   = weight * 3
+        calories = proteins * 4 + fats * 9 + carbs * 4
+        calories2 = proteins * 4 + fats * 9 + carbs2 * 4
+        expected_change = abs(calories - calories2) * 30 / 7.9
+        change_text = f"Прогнозируемая потеря в месяц: {int(expected_change)} г"
+    else:  # Поддержание формы
+        proteins = weight * 1.5
+        fats     = weight - 10
+        carbs    = weight * 3
+        calories = proteins * 4 + fats * 9 + carbs * 4
+        change_text = "Прогнозируемых изменений в массе нет"
+
+    # Собираем и отправляем сообщение
+    text = (
+        f"🏋️‍♂️ <b>Рекомендации по КБЖУ</b>\n\n"
+        f"📏 Ваш вес: {weight:.1f} кг\n"
+        f"🎯 Цель: {goal}\n\n"
+        f"🥩 Белки: {int(proteins)} г\n"
+        f"🧈 Жиры: {int(fats)} г\n"
+        f"🍞 Углеводы: {int(carbs)} г\n"
+        f"🔥 Калории: {int(calories)} ккал\n\n"
+        f"🔄 {change_text}"
+    )
+    await message.answer(text, reply_markup=main_keyboard)
+
 
 # Запуск
 async def main():
