@@ -18,7 +18,9 @@ from dotenv import load_dotenv
 import os
 import asyncio
 from db import async_session, UserData, Analysis
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, func, desc
+from datetime import datetime, date, timedelta
+import dateparser
 
 
 # Загрузка реального токена из .env
@@ -529,7 +531,6 @@ async def kbju_recommendation(message: Message):
     )
     await message.answer(text, reply_markup=main_keyboard)
 
-from sqlalchemy import select
 class AddAnalysis(StatesGroup):
     name = State()
     reference = State()
@@ -543,59 +544,132 @@ async def analyses_menu_handler(message: Message):
 
 @dp.message(F.text == "➕ Добавить анализ")
 async def start_add_analysis(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer("Введите название анализа:")
     await state.set_state(AddAnalysis.name)
+
 @dp.message(AddAnalysis.name)
 async def get_analysis_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await message.answer("Введите референсные значения (например, 120–160):")
+    name_text = message.text.strip()
+    await state.update_data(name=name_text)
+
+    # Проверяем, есть ли уже анализ с таким именем у пользователя
+    from sqlalchemy import select
+    async with async_session() as session:
+        q = select(Analysis).where(
+            Analysis.name.ilike(name_text)
+        ).order_by(desc(Analysis.date))  # сортировка по дате, от нового к старому
+        existing = (await session.execute(q)).scalars().first()
+
+
+    if existing:
+    # Сохраняем найденные данные во временное хранилище
+        await state.update_data(
+            reference=existing.reference,
+            units=existing.units
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да, использовать", callback_data="use_existing"),
+                InlineKeyboardButton(text="Нет, ввести свои", callback_data="enter_custom")
+            ]
+        ])
+
+        await message.answer(
+            f"Анализ с названием: '{name_text}' найден.\n"
+            f"Референсные значения: {existing.reference}\n"
+            f"Единицы измерения: {existing.units}\n"
+            "Хотите использовать эти значения?",
+            reply_markup=keyboard
+        )
+    else:
+        await message.answer("Введите референсные значения (например, 120–160):")
+        await state.set_state(AddAnalysis.reference)
+        
+@dp.callback_query(F.data == "use_existing")
+async def use_existing_analysis(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    name = data.get("name")
+    reference = data.get("reference")
+    units = data.get("units")
+
+    await callback.message.answer(
+        f"Вы выбрали использовать существующие данные\n"
+    )
+    await callback.message.answer("Введите результат анализа:")
+    await state.set_state(AddAnalysis.result)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "enter_custom")
+async def enter_custom_analysis(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите референсные значения (например, 120–160):")
     await state.set_state(AddAnalysis.reference)
+    await callback.answer()
 
 @dp.message(AddAnalysis.reference)
 async def get_analysis_reference(message: Message, state: FSMContext):
-    await state.update_data(reference=message.text)
+    await state.update_data(reference=message.text.strip())
     await message.answer("Введите единицы измерения (например, г/л):")
     await state.set_state(AddAnalysis.units)
 
 @dp.message(AddAnalysis.units)
 async def get_analysis_units(message: Message, state: FSMContext):
-    await state.update_data(units=message.text)
+    await state.update_data(units=message.text.strip())
     await message.answer("Введите результат анализа:")
     await state.set_state(AddAnalysis.result)
 
 @dp.message(AddAnalysis.result)
 async def get_analysis_result(message: Message, state: FSMContext):
-    await state.update_data(result=message.text)
-    await message.answer("Введите дату сдачи анализа (в формате ГГГГ-ММ-ДД):")
+    await state.update_data(result=message.text.strip())
+    await message.answer(
+        "Введите дату сдачи анализа\n"
+        "(можно в формате ГГГГ-ММ-ДД,  ГГГГ.ММ.ДД или словами 'сегодня', 'вчера'):"
+    )
     await state.set_state(AddAnalysis.date)
 
 @dp.message(AddAnalysis.date)
 async def get_analysis_date(message: Message, state: FSMContext):
+    text = message.text.strip().lower()
     try:
-        user_data = await state.get_data()
-        date_value = message.text.strip()
-        
-        # Простая проверка формата даты
-        from datetime import datetime
-        date_obj = datetime.strptime(date_value, "%Y-%m-%d").date()
+        # Поддержка слов 'сегодня', 'завтра', 'вчера'
+        if text in ['сегодня', 'today']:
+            parsed_date = date.today()
+        elif text in ['вчера', 'yesterday']:
+            parsed_date = date.today() - timedelta(days=1)
+        else:
+            # Попытка распознать в разных форматах через dateparser
+            dt = dateparser.parse(text, languages=['ru', 'en'])
+            if dt:
+                parsed_date = dt.date()
+            else:
+                raise ValueError("Не удалось распознать дату")
 
+        user_data = await state.get_data()
+        # Сохраняем в БД
         async with async_session() as session:
             async with session.begin():
                 new_analysis = Analysis(
                     telegram_id=message.from_user.id,
-                    name=user_data["name"],
-                    reference=user_data["reference"],
-                    units=user_data["units"],
-                    result=user_data["result"],
-                    date=date_obj
+                    name=user_data['name'],
+                    reference=user_data['reference'],
+                    units=user_data['units'],
+                    result=user_data['result'],
+                    date=parsed_date
                 )
                 session.add(new_analysis)
 
-        await message.answer("✅ Анализ успешно добавлен!", reply_markup=analysis_keyboard)
+        await message.answer(
+            f"✅ Анализ '{user_data['name']}' от {parsed_date.isoformat()} успешно добавлен!",
+            reply_markup=analysis_keyboard
+        )
         await state.clear()
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}. Повторите ввод даты в формате ГГГГ-ММ-ДД.")
-
+        await message.answer(
+            "❌ Не удалось обработать дату. Пожалуйста, введите ещё раз в формате 'ГГГГ-ММ-ДД', "
+            "дд.мм.гггг или словом 'сегодня', 'вчера'."
+        )
 
 @dp.message(F.text == "📋 Посмотреть анализы")
 async def show_analyses_handler(message: Message):
@@ -691,8 +765,6 @@ async def process_delete_analysis_cb(callback_query: CallbackQuery, state: FSMCo
             if analysis:
                 await session.delete(analysis)
 
-    # закрываем «ждущую» анимацию и редактируем сообщение
-    await callback_query.answer("Удаляю…")
     await callback_query.message.edit_text(
         f"✅ Анализ «{analysis.name}» от {analysis.date.strftime('%Y-%m-%d')} удалён."
     )
