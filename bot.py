@@ -9,6 +9,7 @@ from aiogram.types import (
     CallbackQuery
 )
 from aiogram.filters import CommandStart, StateFilter
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
@@ -16,8 +17,9 @@ from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 import os
 import asyncio
-from db import async_session, UserData  # ваша модель
-from sqlalchemy import select, delete, text
+from db import async_session, UserData, Analysis
+from sqlalchemy import select, delete, func
+
 
 # Загрузка реального токена из .env
 load_dotenv()
@@ -35,8 +37,8 @@ main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Данные пользователя")],
         [KeyboardButton(text="🍽 Рекомендации по КБЖУ")],
-        [KeyboardButton(text="🧪 Добавить анализ")],
-        [KeyboardButton(text="📊 Получить рекомендации")],
+        [KeyboardButton(text="🧪 Анализы")],
+        [KeyboardButton(text="📊 Рекомендации")],
         [KeyboardButton(text="💊 Назначения врачей")],
         [KeyboardButton(text="🩻 Обследования")],
         [KeyboardButton(text="❌ Удалить пользователя")]
@@ -51,6 +53,16 @@ fill_data_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="👁️ Посмотреть текущие данные")],
         [KeyboardButton(text="✏️ Редактировать данные")],
         [KeyboardButton(text="❌ Удалить данные")],
+        [KeyboardButton(text="⬅️ Назад")]
+    ],
+    resize_keyboard=True
+)
+
+analysis_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Добавить анализ")],
+        [KeyboardButton(text="📋 Посмотреть анализы")],
+        [KeyboardButton(text="❌ Удалить анализ")],
         [KeyboardButton(text="⬅️ Назад")]
     ],
     resize_keyboard=True
@@ -517,6 +529,174 @@ async def kbju_recommendation(message: Message):
     )
     await message.answer(text, reply_markup=main_keyboard)
 
+from sqlalchemy import select
+class AddAnalysis(StatesGroup):
+    name = State()
+    reference = State()
+    units = State()
+    result = State()
+    date = State()
+    
+@dp.message(F.text == "🧪 Анализы")
+async def analyses_menu_handler(message: Message):
+    await message.answer("Выберите действие с анализами:", reply_markup=analysis_keyboard)
+
+@dp.message(F.text == "➕ Добавить анализ")
+async def start_add_analysis(message: Message, state: FSMContext):
+    await message.answer("Введите название анализа:")
+    await state.set_state(AddAnalysis.name)
+@dp.message(AddAnalysis.name)
+async def get_analysis_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Введите референсные значения (например, 120–160):")
+    await state.set_state(AddAnalysis.reference)
+
+@dp.message(AddAnalysis.reference)
+async def get_analysis_reference(message: Message, state: FSMContext):
+    await state.update_data(reference=message.text)
+    await message.answer("Введите единицы измерения (например, г/л):")
+    await state.set_state(AddAnalysis.units)
+
+@dp.message(AddAnalysis.units)
+async def get_analysis_units(message: Message, state: FSMContext):
+    await state.update_data(units=message.text)
+    await message.answer("Введите результат анализа:")
+    await state.set_state(AddAnalysis.result)
+
+@dp.message(AddAnalysis.result)
+async def get_analysis_result(message: Message, state: FSMContext):
+    await state.update_data(result=message.text)
+    await message.answer("Введите дату сдачи анализа (в формате ГГГГ-ММ-ДД):")
+    await state.set_state(AddAnalysis.date)
+
+@dp.message(AddAnalysis.date)
+async def get_analysis_date(message: Message, state: FSMContext):
+    try:
+        user_data = await state.get_data()
+        date_value = message.text.strip()
+        
+        # Простая проверка формата даты
+        from datetime import datetime
+        date_obj = datetime.strptime(date_value, "%Y-%m-%d").date()
+
+        async with async_session() as session:
+            async with session.begin():
+                new_analysis = Analysis(
+                    telegram_id=message.from_user.id,
+                    name=user_data["name"],
+                    reference=user_data["reference"],
+                    units=user_data["units"],
+                    result=user_data["result"],
+                    date=date_obj
+                )
+                session.add(new_analysis)
+
+        await message.answer("✅ Анализ успешно добавлен!", reply_markup=analysis_keyboard)
+        await state.clear()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}. Повторите ввод даты в формате ГГГГ-ММ-ДД.")
+
+
+@dp.message(F.text == "📋 Посмотреть анализы")
+async def show_analyses_handler(message: Message):
+    async with async_session() as session:
+        async with session.begin():
+            result = await session.execute(
+                select(Analysis).where(Analysis.telegram_id == message.from_user.id)
+            )
+            analyses = result.scalars().all()
+
+    if not analyses:
+        await message.answer(
+            "📋 У вас ещё нет ни одного анализа.",
+            reply_markup=main_keyboard
+        )
+        return
+
+    text = "<b>Ваши анализы:</b>\n\n"
+    for a in analyses:
+        date_str = a.date.isoformat() if a.date else "—"
+        text += (
+            f"📅 {date_str}: <b>{a.name}</b> — {a.result or '—'} {a.units or ''} "
+            f"(Референсные значения: {a.reference or '—'})\n"
+        )
+
+    await message.answer(text, reply_markup=analysis_keyboard)
+
+class DeleteAnalysis(StatesGroup):
+    name = State()
+    choosing = State()
+
+@dp.message(F.text == "❌ Удалить анализ")
+async def start_delete_analysis(message: Message, state: FSMContext):
+    await message.answer("Введите название анализа, который вы хотите удалить:")
+    await state.set_state(DeleteAnalysis.name)
+
+@dp.message(DeleteAnalysis.name)
+async def delete_analysis_by_name(message: Message, state: FSMContext):
+    analysis_name = message.text.strip()
+
+    async with async_session() as session:
+        async with session.begin():
+            result = await session.execute(
+                select(Analysis)
+                .where(
+                    func.lower(Analysis.name) == analysis_name.lower(),
+                    Analysis.telegram_id == message.from_user.id
+                )
+            )
+            analyses = result.scalars().all()
+
+    if not analyses:
+        await message.answer("❌ Анализ с таким названием не найден.")
+        await state.clear()
+        return
+
+    # Если ровно один — удаляем сразу
+    if len(analyses) == 1:
+        async with async_session() as session:
+            async with session.begin():
+                await session.delete(analyses[0])
+        await message.answer(f"✅ Анализ «{analyses[0].name}» удалён.")
+        await state.clear()
+        return
+
+    # Если несколько — строим кнопки
+    builder = InlineKeyboardBuilder()
+    for analysis in analyses:
+        btn_text = f"{analysis.name} — {analysis.date.strftime('%Y-%m-%d')}"
+        builder.button(
+            text=btn_text,
+            callback_data=f"del_analysis:{analysis.id}"
+        )
+    builder.adjust(1)  # 1 кнопка в ряду
+
+    await message.answer(
+        "Найдено несколько анализов. Выберите, какой удалить:", 
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(DeleteAnalysis.choosing)
+
+@dp.callback_query(DeleteAnalysis.choosing, lambda cb: cb.data.startswith("del_analysis:"))
+async def process_delete_analysis_cb(callback_query: CallbackQuery, state: FSMContext):
+    # cb.data = "del_analysis:<id>"
+    analysis_id = int(callback_query.data.split(":", 1)[1])
+
+    async with async_session() as session:
+        async with session.begin():
+            result = await session.execute(
+                select(Analysis).where(Analysis.id == analysis_id)
+            )
+            analysis = result.scalar_one_or_none()
+            if analysis:
+                await session.delete(analysis)
+
+    # закрываем «ждущую» анимацию и редактируем сообщение
+    await callback_query.answer("Удаляю…")
+    await callback_query.message.edit_text(
+        f"✅ Анализ «{analysis.name}» от {analysis.date.strftime('%Y-%m-%d')} удалён."
+    )
+    await state.clear()
 
 # Запуск
 async def main():
