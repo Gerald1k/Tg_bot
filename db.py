@@ -1,20 +1,23 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Text, Float, BigInteger, Date  # добавлены BigInteger, Date
+from sqlalchemy import Column, Integer, String, Text, Float, BigInteger, Date
 from os import getenv
 from dotenv import load_dotenv
 import asyncio
 
+# Загрузка переменных окружения из .env
 load_dotenv()
 
 DATABASE_URL = getenv("DATABASE_URL")
 
-# Создаем движок
+# Создаем асинхронный движок SQLAlchemy
 engine = create_async_engine(DATABASE_URL, echo=True)
 
-# Создаем сессию
+# Создаем сессию для работы с БД
 async_session = sessionmaker(
-    engine, expire_on_commit=False, class_=AsyncSession
+    engine,
+    expire_on_commit=False,
+    class_=AsyncSession
 )
 
 # Базовый класс для моделей
@@ -38,25 +41,38 @@ class UserData(Base):
     heredity = Column(Text)
     symptoms = Column(Text)
 
-# Новая модель анализа
+# Модель анализа пользователя
 class Analysis(Base):
     __tablename__ = "analysis"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     telegram_id = Column(BigInteger, nullable=False)
     name = Column(String(255))
+    group_name = Column(String(255))
     reference = Column(String(255))
     units = Column(String(50))
     result = Column(Text)
     date = Column(Date)
 
-# Функция только для создания недостающих таблиц
+# Модель справочника анализов
+class AnalyzesMem(Base):
+    __tablename__ = "analyzes_mems"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    group_name = Column(String(100), nullable=False)
+    unit = Column(String(50), nullable=False)
+    standard_unit = Column(String(50), nullable=False)            # Стандартная единица измерения
+    reference_values = Column(String(100), nullable=False)
+    standard_reference = Column(String(100), nullable=False)      # Референсные значения в стандартной единице
+    conversion_to_standard = Column(Float, nullable=False)        # Коэффициент пересчета в стандартную ед.изм
+    
+# Функция для создания всех таблиц
 async def init_db():
     async with engine.begin() as conn:
-        # Не удаляем существующие таблицы!
         await conn.run_sync(Base.metadata.create_all)
 
-# Инициализация БД при запуске
+# Запуск инициализации БД при прямом запуске
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
