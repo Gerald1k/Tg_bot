@@ -22,11 +22,12 @@ from db import async_session, UserData, Analysis, AnalyzesMem
 from sqlalchemy import select, delete, func, desc
 from datetime import datetime, date, timedelta
 import dateparser
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.styles import getSampleStyleSheet
 from io import BytesIO
 import tempfile
 import re
@@ -923,6 +924,7 @@ async def all_msg(callback: CallbackQuery):
 # 4. Вывод всех анализов в PDF (два последних результата)
 @dp.callback_query(F.data == "all_pdf")
 async def all_pdf(callback: CallbackQuery):
+    # --- Получаем данные ---
     async with async_session() as session:
         q = (
             select(Analysis)
@@ -932,48 +934,92 @@ async def all_pdf(callback: CallbackQuery):
         res = await session.execute(q)
         analyses = res.scalars().all()
 
+    # --- Группируем по названию ---
     grouped = {}
     for a in analyses:
         grouped.setdefault(a.name, []).append(a)
 
-    table_data = [[
+    # --- Подготовка таблицы и стилей ---
+    data = [[
         'Анализ', 'Последний результат (дата)',
         'Предыдущий результат (дата)', 'Референс', 'Ед. изм.'
     ]]
+    styles = [
+        ('FONTNAME',   (0,0), (-1,-1), 'ArialUnicode'),
+        ('GRID',       (0,0), (-1,-1), 0.5, colors.black),
+        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+    ]
+
+    # Шаблон для Paragraph
+    stylesheet = getSampleStyleSheet()
+    body = stylesheet['BodyText']
+    body.fontName = 'ArialUnicode'
+    body.fontSize = 10
+
+    row = 1
     for name, items in grouped.items():
         last = items[0]
         prev = items[1] if len(items) > 1 else None
-        table_data.append([
-            name,
-            f"{last.result} ({last.date.strftime('%d.%m.%Y')})",
-            f"{prev.result} ({prev.date.strftime('%d.%m.%Y')})" if prev else '—',
-            last.reference or '—',
-            last.units or '—'
+
+        # Функция для создания окрашенного Paragraph
+        def make_para(item):
+            txt = item.result
+            date_str = item.date.strftime('%d.%m.%Y')
+            color = None
+            try:
+                val = float(item.result.replace(',', '.'))
+                parts = re.split(r'[^0-9,\.]+', item.reference or '')
+                nums = [p.replace(',', '.') for p in parts if p]
+                if len(nums) >= 2:
+                    lo, hi = map(float, nums[:2])
+                    color = 'green' if lo <= val <= hi else 'red'
+            except:
+                pass
+
+            if color:
+                # цветим только число, дату оставляем чёрной
+                return Paragraph(
+                    f'<font name="ArialUnicode">'
+                    f'<font color="{color}">{txt}</font> '
+                    f'({date_str})'
+                    f'</font>',
+                    body
+                )
+            else:
+                return Paragraph(f'{txt} ({date_str})', body)
+
+        last_para = make_para(last)
+        prev_para = make_para(prev) if prev else Paragraph('—', body)
+
+        data.append([
+            Paragraph(name, body),
+            last_para,
+            prev_para,
+            Paragraph(last.reference or '—', body),
+            Paragraph(last.units or '—', body),
         ])
+        row += 1
 
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    table = Table(table_data)
-    table.setStyle(TableStyle([
-        ('FONTNAME',    (0,0), (-1,-1), 'ArialUnicode'),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.black),
-        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey)
-    ]))
-    doc.build([table])
-    buffer.seek(0)
+    # --- Генерируем PDF ---
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4)
+    tbl = Table(
+        data,
+        colWidths=[80, 150, 150, 70, 60],  # 80 пунктов для столбца "Ед. изм."
+        repeatRows=1
+    )
+    tbl.setStyle(TableStyle(styles))
+    doc.build([tbl])
+    buf.seek(0)
 
-    # 1) пишем PDF во временный файл на диске
+    # --- Отправляем пользователю ---
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tf:
-        tf.write(buffer.read())
-        temp_path = tf.name
+        tf.write(buf.read())
+        path = tf.name
 
-    # 2) отправляем его через FSInputFile
-    file = FSInputFile(temp_path, filename='all_analyses.pdf')
-    await callback.message.answer_document(file)
+    await callback.message.answer_document(FSInputFile(path, filename='all_analyses.pdf'))
     await callback.answer()
-
-    # 3) удаляем временный файл
-    os.remove(temp_path)
+    os.remove(path)
 
 # 5. Вывод по дате
 @dp.callback_query(F.data.startswith("view_date|"))
@@ -1109,79 +1155,196 @@ async def cancel_view(callback: CallbackQuery):
     await callback.answer()
     
 # --------------- Удаление анализов -----------------
-class DeleteAnalysis(StatesGroup):
-    name = State()
-    choosing = State()
+class DeleteFlow(StatesGroup):
+    waiting_for_group     = State()
+    waiting_for_name      = State()
+    waiting_for_analysis  = State()
+    confirm_delete        = State()
 
 @dp.message(F.text == "❌ Удалить анализ")
 async def start_delete_analysis(message: Message, state: FSMContext):
-    await message.answer("Введите название анализа, который вы хотите удалить:")
-    await state.set_state(DeleteAnalysis.name)
-
-@dp.message(DeleteAnalysis.name)
-async def delete_analysis_by_name(message: Message, state: FSMContext):
-    analysis_name = message.text.strip()
-
+    # Шаг 1: список групп
     async with async_session() as session:
-        async with session.begin():
-            result = await session.execute(
-                select(Analysis)
-                .where(
-                    func.lower(Analysis.name) == analysis_name.lower(),
-                    Analysis.telegram_id == message.from_user.id
-                )
+        res = await session.execute(
+            select(Analysis.group_name)
+            .where(Analysis.telegram_id == message.from_user.id)
+            .distinct()
+        )
+        groups = [r[0] for r in res.all()]
+
+    if not groups:
+        await message.answer("У вас ещё нет ни одного анализа для удаления.")
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=g, callback_data=f"del_group|{g}")]
+            for g in groups
+        ] + [[InlineKeyboardButton(text="❌ Отмена", callback_data="del_cancel")]]
+    )
+    await message.answer("Выберите группу анализа для удаления:", reply_markup=kb)
+    await state.set_state(DeleteFlow.waiting_for_group)
+
+# Отмена на первом шаге — выход из потока
+@dp.callback_query(DeleteFlow.waiting_for_group, F.data == "del_cancel")
+async def cancel_delete_group(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("❌ Удаление отменено.")
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(DeleteFlow.waiting_for_group, F.data.startswith("del_group|"))
+async def choose_delete_group(callback: CallbackQuery, state: FSMContext):
+    group = callback.data.split("|", 1)[1]
+    await state.update_data(group=group)
+
+    # Шаг 2: список названий в группе
+    async with async_session() as session:
+        res = await session.execute(
+            select(Analysis.name)
+            .where(
+                Analysis.telegram_id == callback.from_user.id,
+                Analysis.group_name == group
             )
-            analyses = result.scalars().all()
+            .distinct()
+        )
+        names = [r[0] for r in res.all()]
+
+    if not names:
+        await callback.message.edit_text("В этой группе нет анализов.")
+        await state.clear()
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=n, callback_data=f"del_name|{n}")]
+            for n in names
+        ] + [[InlineKeyboardButton(text="◀️ Назад", callback_data="del_back")]]
+    )
+    await callback.message.edit_text("Выберите название анализа:", reply_markup=kb)
+    await state.set_state(DeleteFlow.waiting_for_name)
+    await callback.answer()
+
+# «Назад» к выбору группы
+@dp.callback_query(DeleteFlow.waiting_for_name, F.data == "del_back")
+async def back_to_group(callback: CallbackQuery, state: FSMContext):
+    async with async_session() as session:
+        res = await session.execute(
+            select(Analysis.group_name)
+            .where(Analysis.telegram_id == callback.from_user.id)
+            .distinct()
+        )
+        groups = [r[0] for r in res.all()]
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=g, callback_data=f"del_group|{g}")]
+            for g in groups
+        ] + [[InlineKeyboardButton(text="❌ Отмена", callback_data="del_cancel")]]
+    )
+    await callback.message.edit_text("Выберите группу анализа для удаления:", reply_markup=kb)
+    await state.set_state(DeleteFlow.waiting_for_group)
+    await callback.answer()
+
+@dp.callback_query(DeleteFlow.waiting_for_name, F.data.startswith("del_name|"))
+async def choose_delete_name(callback: CallbackQuery, state: FSMContext):
+    name = callback.data.split("|", 1)[1]
+    await state.update_data(name=name)
+
+    # Шаг 3: список конкретных записей
+    async with async_session() as session:
+        res = await session.execute(
+            select(Analysis)
+            .where(
+                Analysis.telegram_id == callback.from_user.id,
+                Analysis.name == name
+            )
+            .order_by(desc(Analysis.date))
+        )
+        analyses = res.scalars().all()
 
     if not analyses:
-        await message.answer("❌ Анализ с таким названием не найден.")
+        await callback.message.edit_text("Нет записей для этого анализа.")
         await state.clear()
         return
 
-    # Если ровно один — удаляем сразу
-    if len(analyses) == 1:
-        async with async_session() as session:
-            async with session.begin():
-                await session.delete(analyses[0])
-        await message.answer(f"✅ Анализ «{analyses[0].name}» удалён.")
-        await state.clear()
-        return
-
-    # Если несколько — строим кнопки
-    builder = InlineKeyboardBuilder()
-    for analysis in analyses:
-        btn_text = f"{analysis.name} — {analysis.date.strftime('%Y-%m-%d')}"
-        builder.button(
-            text=btn_text,
-            callback_data=f"del_analysis:{analysis.id}"
-        )
-    builder.adjust(1)  # 1 кнопка в ряду
-
-    await message.answer(
-        "Найдено несколько анализов. Выберите, какой удалить:", 
-        reply_markup=builder.as_markup()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{a.date.strftime('%d.%m.%Y')}: {a.result or '—'} {a.units or ''}",
+                callback_data=f"del_select|{a.id}"
+            )]
+            for a in analyses
+        ] + [[InlineKeyboardButton(text="◀️ Назад", callback_data="del_back")]]
     )
-    await state.set_state(DeleteAnalysis.choosing)
+    await callback.message.edit_text(
+        f"Вы выбрали «{name}». Выберите запись для удаления:",
+        reply_markup=kb
+    )
+    await state.set_state(DeleteFlow.waiting_for_analysis)
+    await callback.answer()
 
-@dp.callback_query(DeleteAnalysis.choosing, lambda cb: cb.data.startswith("del_analysis:"))
-async def process_delete_analysis_cb(callback_query: CallbackQuery, state: FSMContext):
-    # cb.data = "del_analysis:<id>"
-    analysis_id = int(callback_query.data.split(":", 1)[1])
+# «Назад» к выбору названия анализа
+@dp.callback_query(DeleteFlow.waiting_for_analysis, F.data == "del_back")
+async def back_to_name(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    group = data.get("group")
+    async with async_session() as session:
+        res = await session.execute(
+            select(Analysis.name)
+            .where(
+                Analysis.telegram_id == callback.from_user.id,
+                Analysis.group_name == group
+            )
+            .distinct()
+        )
+        names = [r[0] for r in res.all()]
 
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=n, callback_data=f"del_name|{n}")]
+            for n in names
+        ] + [[InlineKeyboardButton(text="◀️ Назад", callback_data="del_back")]]
+    )
+    await callback.message.edit_text("Выберите название анализа:", reply_markup=kb)
+    await state.set_state(DeleteFlow.waiting_for_name)
+    await callback.answer()
+
+@dp.callback_query(DeleteFlow.waiting_for_analysis, F.data.startswith("del_select|"))
+async def confirm_delete(callback: CallbackQuery, state: FSMContext):
+    analysis_id = int(callback.data.split("|", 1)[1])
+    async with async_session() as session:
+        analysis = await session.get(Analysis, analysis_id)
+
+    if not analysis:
+        await callback.message.edit_text("Запись не найдена.")
+        await state.clear()
+        return
+
+    await state.update_data(analysis_id=analysis_id)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[  
+            InlineKeyboardButton(text="✅ Да", callback_data=f"del_confirm|{analysis_id}"),
+            InlineKeyboardButton(text="❌ Нет", callback_data="del_cancel")
+        ]]
+    )
+    await callback.message.edit_text(
+        f"Удалить анализ «{analysis.name}» от {analysis.date.strftime('%d.%m.%Y')}?",
+        reply_markup=kb
+    )
+    await state.set_state(DeleteFlow.confirm_delete)
+    await callback.answer()
+
+@dp.callback_query(DeleteFlow.confirm_delete, F.data.startswith("del_confirm|"))
+async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
+    analysis_id = int(callback.data.split("|", 1)[1])
     async with async_session() as session:
         async with session.begin():
-            result = await session.execute(
-                select(Analysis).where(Analysis.id == analysis_id)
-            )
-            analysis = result.scalar_one_or_none()
-            if analysis:
-                await session.delete(analysis)
+            await session.execute(delete(Analysis).where(Analysis.id == analysis_id))
 
-    await callback_query.message.edit_text(
-        f"✅ Анализ «{analysis.name}» от {analysis.date.strftime('%Y-%m-%d')} удалён."
-    )
+    await callback.message.edit_text("✅ Анализ успешно удалён.")
     await state.clear()
-
+    await callback.answer()
+#------------------------------------------------------------------------------------------------------------------#
 # Запуск
 async def main():
     await dp.start_polling(bot)
