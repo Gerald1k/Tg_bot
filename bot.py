@@ -10,15 +10,16 @@ from aiogram.types import (
     CallbackQuery
 )
 from aiogram.filters import CommandStart, StateFilter
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters.command import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramAPIError
 from dotenv import load_dotenv
 import os
 import asyncio
-from db import async_session, UserData, Analysis, AnalyzesMem
+from db import async_session, UserData, Analysis, AnalyzesMem, Recommendation, DoctorAppointment, InstrumentalExamination
 from sqlalchemy import select, delete, func, desc
 from datetime import datetime, date, timedelta
 import dateparser
@@ -52,7 +53,7 @@ main_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="📊 Рекомендации")],
         [KeyboardButton(text="💊 Назначения врачей")],
         [KeyboardButton(text="🩻 Обследования")],
-        [KeyboardButton(text="❌ Удалить пользователя")]
+        [KeyboardButton(text="❌ Удалить все данные")]
     ],
     resize_keyboard=True
 )
@@ -74,6 +75,30 @@ analysis_keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text="➕ Добавить анализ")],
         [KeyboardButton(text="📋 Посмотреть анализы")],
         [KeyboardButton(text="❌ Удалить анализ")],
+        [KeyboardButton(text="⬅️ Назад")]
+    ],
+    resize_keyboard=True
+)
+
+# Клавиатура для подменю "Назначения врачей"
+doctor_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Добавить назначение")],
+        [KeyboardButton(text="📋 Посмотреть назначения")],
+        [KeyboardButton(text="✏️ Редактировать назначения")],
+        [KeyboardButton(text="❌ Удалить назначения")],
+        [KeyboardButton(text="⬅️ Назад")]
+    ],
+    resize_keyboard=True
+)
+
+# Клавиатура для подменю "Обследования"
+examination_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="➕ Добавить обследование")],
+        [KeyboardButton(text="📋 Посмотреть обследования")],
+        [KeyboardButton(text="✏️ Редактировать обследования")],
+        [KeyboardButton(text="❌ Удалить обследования")],
         [KeyboardButton(text="⬅️ Назад")]
     ],
     resize_keyboard=True
@@ -1344,6 +1369,546 @@ async def process_delete_confirm(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("✅ Анализ успешно удалён.")
     await state.clear()
     await callback.answer()
+#------------------------------------------------------------------------------------------------------------------#
+                                #Рекомендации#
+                                
+@dp.message(F.text == "📊 Рекомендации")
+async def show_recommendation_categories(message: Message):
+    async with async_session() as session:
+        res = await session.execute(
+            select(Recommendation.category)
+            .where(Recommendation.telegram_id == message.from_user.id)
+            .distinct()
+        )
+        categories = [r[0] for r in res.all()]
+
+    if not categories:
+        await message.answer("У вас пока нет рекомендаций.")
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=cat, callback_data=f"rec_cat|{cat}")]
+            for cat in categories
+        ]
+    )
+    await message.answer("Выберите категорию рекомендаций:", reply_markup=kb)
+
+# Step 2: Show all recommendations in selected category
+@dp.callback_query(F.data.startswith("rec_cat|"))
+async def show_recommendations(callback: CallbackQuery):
+    category = callback.data.split("|", 1)[1]
+    async with async_session() as session:
+        res = await session.execute(
+            select(Recommendation)
+            .where(
+                Recommendation.telegram_id == callback.from_user.id,
+                Recommendation.category == category
+            )
+            .order_by(Recommendation.created_at)
+        )
+        recs = res.scalars().all()
+
+    if not recs:
+        await callback.answer("Нет рекомендаций в этой категории.", show_alert=True)
+        return
+
+    text_lines = [f"<b>📊 Рекомендации — {category}:</b>\n"]
+    for idx, rec in enumerate(recs, 1):
+        created = rec.created_at.strftime("%d.%m.%Y")
+        text_lines.append(f"{idx}. {rec.text} <i>({created})</i>")
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="◀️ Назад", callback_data="rec_back")
+        ]]
+    )
+    await callback.message.edit_text(
+        "\n".join(text_lines),
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+# Step 3: Back to category list
+@dp.callback_query(F.data == "rec_back")
+async def back_to_categories(callback: CallbackQuery):
+    async with async_session() as session:
+        res = await session.execute(
+            select(Recommendation.category)
+            .where(Recommendation.telegram_id == callback.from_user.id)
+            .distinct()
+        )
+        categories = [r[0] for r in res.all()]
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=cat, callback_data=f"rec_cat|{cat}")]
+            for cat in categories
+        ]
+    )
+    await callback.message.edit_text(
+        "Выберите категорию рекомендаций:",
+        reply_markup=kb
+    )
+    await callback.answer()
+#------------------------------------------------------------------------------------------------------------------#
+                                #Назначения врача#        
+
+class AppointmentFlow(StatesGroup):
+    date = State()
+    doctor = State()
+    recommendation = State()
+    next_action = State()
+
+@dp.message(F.text == "💊 Назначения врачей")
+async def analyses_menu_handler(message: Message):
+    await message.answer("Выберите действие с Назначениями врачей:", reply_markup=doctor_keyboard)
+
+# --------------- Добавить назначение -----------------
+# Запуск потока ввода
+@dp.message(F.text == "➕ Добавить назначение")
+async def start_appointments(message: Message, state: FSMContext):
+    await message.answer("Введите дату приёма в формате ДД.ММ.ГГГГ:")
+    await state.set_state(AppointmentFlow.date)
+
+# Обработка даты
+@dp.message(AppointmentFlow.date)
+async def process_date(message: Message, state: FSMContext):
+    try:
+        appt_date = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Неверный формат. Введите дату как ДД.MM.ГГГГ:")
+        return
+
+    await state.update_data(appointment_date=appt_date)
+    await message.answer("Введите специальность врача:")
+    await state.set_state(AppointmentFlow.doctor)
+
+# Обработка врача
+@dp.message(AppointmentFlow.doctor)
+async def process_doctor(message: Message, state: FSMContext):
+    await state.update_data(doctor=message.text.strip())
+    await message.answer("Введите текст назначения от этого врача:")
+    await state.set_state(AppointmentFlow.recommendation)
+
+# Обработка одной рекомендации
+@dp.message(AppointmentFlow.recommendation)
+async def process_recommendation(message: Message, state: FSMContext):
+    data = await state.get_data()
+    appt = DoctorAppointment(
+        telegram_id=message.from_user.id,
+        appointment_date=data["appointment_date"],
+        doctor=data["doctor"],
+        recommendation=message.text.strip()
+    )
+    async with async_session() as session:
+        async with session.begin():
+            session.add(appt)
+
+    # Предлагаем, что делать дальше
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="➕ Ещё от этого врача", callback_data="appt_add_same"),
+        InlineKeyboardButton(text="👩‍⚕️ Другой врач", callback_data="appt_add_new"),
+        InlineKeyboardButton(text="✅ Готово", callback_data="appt_finish"),
+    ]])
+    await message.answer("Запись сохранена. Что дальше?", reply_markup=kb)
+    await state.set_state(AppointmentFlow.next_action)
+
+# Добавить ещё рекомендацию от того же врача
+@dp.callback_query(AppointmentFlow.next_action, F.data == "appt_add_same")
+async def add_more_same(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(None)
+    await callback.message.answer("Введите ещё одно назначение для этого врача:")
+    await state.set_state(AppointmentFlow.recommendation)
+    await callback.answer()
+
+# Перейти к вводу другого врача
+@dp.callback_query(AppointmentFlow.next_action, F.data == "appt_add_new")
+async def add_new_doctor(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(None)
+    await callback.message.answer("Введите специальность или имя следующего врача:")
+    await state.set_state(AppointmentFlow.doctor)
+    await callback.answer()
+
+# Завершить ввод назначений
+@dp.callback_query(AppointmentFlow.next_action, F.data == "appt_finish")
+async def finish_appointments(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(None)
+    await callback.message.answer("✅ Все назначения сохранены.")
+    await state.clear()
+    await callback.answer()
+    
+# --------------- Посмотреть назначение -----------------
+@dp.message(F.text == "📋 Посмотреть назначения")
+async def view_doctor_appointments(message: types.Message):
+    telegram_id = message.from_user.id
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(DoctorAppointment.doctor).where(DoctorAppointment.telegram_id == telegram_id)
+        )
+        doctors = list(set(row[0] for row in result.fetchall()))
+
+    if not doctors:
+        await message.answer("У вас пока нет назначений.")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=doc, callback_data=f"view_appt_{doc}")]
+            for doc in doctors
+        ]
+    )
+    await message.answer("Выберите врача, чтобы посмотреть назначения:", reply_markup=keyboard)
+    
+@dp.callback_query(F.data.startswith("view_appt_"))
+async def show_appointments_by_doctor(callback: types.CallbackQuery):
+    telegram_id = callback.from_user.id
+    doctor = callback.data.removeprefix("view_appt_")
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(DoctorAppointment).where(
+                DoctorAppointment.telegram_id == telegram_id,
+                DoctorAppointment.doctor == doctor
+            ).order_by(DoctorAppointment.appointment_date.desc())
+        )
+        appointments = result.scalars().all()
+
+    if not appointments:
+        await callback.message.answer("Назначений от этого врача не найдено.")
+        await callback.answer()
+        return
+
+    text = f"📋 Назначения от врача: <b>{doctor}</b>\n\n"
+    for appt in appointments:
+        date = appt.appointment_date.strftime("%d.%m.%Y")
+        text += f"🗓 <b>{date}</b>\n📝 {appt.recommendation}\n\n"
+
+    await callback.message.answer(text)
+    await callback.answer()
+
+# --------------- Редактировать назначение -----------------
+
+@dp.message(F.text == "✏️ Редактировать назначения")
+async def choose_doctor_to_edit(callback: types.Message):
+    telegram_id = callback.from_user.id
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(DoctorAppointment.doctor).where(DoctorAppointment.telegram_id == telegram_id)
+        )
+        doctors = list(set(row[0] for row in result.fetchall()))
+
+    if not doctors:
+        await callback.answer("У вас пока нет назначений.")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=doc, callback_data=f"edit_doc_{doc}")]
+            for doc in doctors
+        ]
+    )
+    await callback.answer("Выберите врача для редактирования назначения:", reply_markup=keyboard)
+
+# Обработчик выбора врача для редактирования
+@dp.callback_query(F.data.startswith("edit_doc_"))
+async def choose_appointment_to_edit(callback: types.CallbackQuery):
+    telegram_id = callback.from_user.id
+    doctor = callback.data.removeprefix("edit_doc_")
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(DoctorAppointment).where(
+                DoctorAppointment.telegram_id == telegram_id,
+                DoctorAppointment.doctor == doctor
+            ).order_by(DoctorAppointment.appointment_date.desc())
+        )
+        appointments = result.scalars().all()
+
+    if not appointments:
+        await callback.message.edit_text("У этого врача нет назначений.")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{appt.appointment_date.strftime('%d.%m.%Y')} {appt.recommendation[:25]}{'...' if len(appt.recommendation) > 25 else ''}",
+                callback_data=f"edit_appt_{appt.id}"
+            )]
+            for appt in appointments
+        ]
+    )
+    await callback.message.edit_text("Выберите назначение для редактирования:", reply_markup=keyboard)
+
+# Обработчик выбора назначения для редактирования
+@dp.callback_query(F.data.startswith("edit_appt_"))
+async def ask_for_new_text(callback: types.CallbackQuery, state: FSMContext):
+    appt_id = int(callback.data.removeprefix("edit_appt_"))
+    await state.update_data(appt_id=appt_id)
+
+    # Кнопка для отмены редактирования
+    cancel_button = InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[cancel_button]])
+
+    await callback.message.edit_text("Введите новый текст назначения:", reply_markup=keyboard)
+    await state.set_state(EditAppointmentState.waiting_for_text)
+
+# Состояние для редактирования текста назначения
+class EditAppointmentState(StatesGroup):
+    waiting_for_text = State()
+
+# Обработчик ввода нового текста для назначения
+@dp.message(EditAppointmentState.waiting_for_text)
+async def save_edited_text(message: types.Message, state: FSMContext):
+    new_text = message.text
+    data = await state.get_data()
+    appt_id = data['appt_id']
+
+    async with async_session() as session:
+        result = await session.execute(select(DoctorAppointment).where(DoctorAppointment.id == appt_id))
+        appt = result.scalar_one_or_none()
+
+        if not appt:
+            await message.answer("Ошибка: назначение не найдено.")
+            await state.clear()
+            return
+
+        appt.recommendation = new_text
+        await session.commit()
+
+    await message.answer("Текст назначения успешно обновлён ✅")
+    await state.clear()
+
+# Обработчик для отмены редактирования
+@dp.callback_query(F.data == "cancel_edit")
+async def cancel_edit(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Редактирование отменено.")
+    await state.clear()
+    
+# --------------- Редактировать назначение -----------------
+
+# Обработчик команды "Удалить назначения"
+@dp.message(F.text == "❌ Удалить назначения")
+async def choose_doctor_to_delete(callback: types.Message):
+    telegram_id = callback.from_user.id
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(DoctorAppointment.doctor).where(DoctorAppointment.telegram_id == telegram_id)
+        )
+        doctors = list(set(row[0] for row in result.fetchall()))  # Уникальные врачи
+
+    if not doctors:
+        await callback.answer("У вас пока нет назначений.")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=doc, callback_data=f"delete_doc_{doc}")]
+            for doc in doctors
+        ]
+    )
+
+    # Добавляем кнопку отмены
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_delete")])
+
+    await callback.answer("Выберите врача для удаления назначения:", reply_markup=keyboard)
+
+
+# Обработчик выбора врача для удаления
+@dp.callback_query(F.data.startswith("delete_doc_"))
+async def choose_appointment_to_delete(callback: types.CallbackQuery):
+    telegram_id = callback.from_user.id
+    doctor = callback.data.removeprefix("delete_doc_")
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(DoctorAppointment).where(
+                DoctorAppointment.telegram_id == telegram_id,
+                DoctorAppointment.doctor == doctor
+            ).order_by(DoctorAppointment.appointment_date.desc())
+        )
+        appointments = result.scalars().all()
+
+    if not appointments:
+        await callback.message.edit_text("У этого врача нет назначений.")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{appt.appointment_date.strftime('%d.%m.%Y')} {appt.recommendation[:25]}{'...' if len(appt.recommendation) > 25 else ''}",
+                callback_data=f"delete_appt_{appt.id}"
+            )]
+            for appt in appointments
+        ]
+    )
+
+    # Добавляем кнопку отмены с использованием append
+    cancel_button = InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_delete")
+    keyboard.inline_keyboard.append([cancel_button])  # исправлено на append
+
+    await callback.message.edit_text("Выберите назначение для удаления:", reply_markup=keyboard)
+
+
+# Обработчик выбора назначения для удаления
+@dp.callback_query(F.data.startswith("delete_appt_"))
+async def confirm_delete_appointment(callback: types.CallbackQuery, state: FSMContext):
+    appt_id = int(callback.data.removeprefix("delete_appt_"))
+    await state.update_data(appt_id=appt_id)
+
+    # Кнопки для подтверждения удаления
+    confirm_button = InlineKeyboardButton(text="✅ Да", callback_data="confirm_delete_yes")
+    cancel_button = InlineKeyboardButton(text="❌ Нет", callback_data="cancel_delete")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[confirm_button, cancel_button]])
+
+    await callback.message.edit_text("Вы точно хотите удалить это назначение?", reply_markup=keyboard)
+
+# Обработчик подтверждения удаления
+@dp.callback_query(F.data == "confirm_delete_yes")
+async def delete_appointment(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    appt_id = data['appt_id']
+
+    async with async_session() as session:
+        result = await session.execute(select(DoctorAppointment).where(DoctorAppointment.id == appt_id))
+        appt = result.scalar_one_or_none()
+
+        if not appt:
+            await callback.message.edit_text("Ошибка: назначение не найдено.")
+            await state.clear()
+            return
+
+        # Удаляем назначение
+        await session.delete(appt)
+        await session.commit()
+
+    await callback.message.edit_text("Назначение успешно удалено ✅")
+    await state.clear()
+
+# Обработчик для отмены удаления
+@dp.callback_query(F.data == "cancel_delete")
+async def cancel_delete(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Операция удаления отменена.")
+    await state.clear()
+    
+    
+#------------------------------------------------------------------------------------------------------------------#
+                                #Обследования#
+
+UPLOAD_DIR = "uploaded_files"  # Папка для сохранения файлов
+
+# Создание директории, если её нет
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
+async def save_examination_file(message: Message):
+    try:
+        # Получаем файл с помощью file_id
+        file_info = await bot.get_file(message.document.file_id)
+        file_name = message.document.file_name
+
+        # Путь для сохранения файла
+        file_path = os.path.join(UPLOAD_DIR, file_name)
+
+        # Загружаем файл на диск
+        await bot.download_file(file_info.file_path, file_path)
+
+        return file_path  # Возвращаем путь к файлу
+
+    except TelegramAPIError as e:
+        print(f"Ошибка при получении файла: {e}")
+        return None
+
+@dp.message(F.text == "🩻 Обследования")
+async def examinations_menu_handler(message: types.Message):
+    await message.answer("Выберите действие с обследованиями:", reply_markup=examination_keyboard)
+
+@dp.message(F.text == "➕ Добавить обследование")
+async def add_examination(message: types.Message, state: FSMContext):
+    await message.answer("🩻 Введите название обследования:")
+    await state.set_state("examination_name")
+
+@dp.message(StateFilter("examination_name"))
+async def get_examination_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("📅 Введите дату обследования (в формате ДД.ММ.ГГГГ):")
+    await state.set_state("examination_date")
+
+@dp.message(StateFilter("examination_date"))
+async def get_examination_date(message: types.Message, state: FSMContext):
+    try:
+        date = datetime.strptime(message.text, "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("❗ Неверный формат даты. Попробуйте ещё раз (ДД.ММ.ГГГГ):")
+        return
+
+    await state.update_data(date=date)
+    await message.answer("📝 Введите краткое описание обследования:")
+    await state.set_state("examination_description")
+
+@dp.message(StateFilter("examination_description"))
+async def get_examination_description(message: types.Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await message.answer("📎 Прикрепите файл (до 50 МБ) или нажмите /skip, если файл не нужен:")
+    await state.set_state("examination_file")
+
+@dp.message(StateFilter("examination_file"), F.document)
+async def get_examination_file(message: types.Message, state: FSMContext):
+    file = message.document
+
+    if file.file_size > 50 * 1024 * 1024:
+        await message.answer("❗ Файл слишком большой. Пожалуйста, прикрепите файл размером до 50 МБ.")
+        return
+
+    # Сохраняем файл и получаем путь
+    file_path = await save_examination_file(message)
+
+    await state.update_data(file=file_path)
+    await save_examination(message, state)
+
+@dp.message(StateFilter("examination_file"), Command("skip"))
+async def skip_examination_file(message: types.Message, state: FSMContext):
+    await state.update_data(file=None)
+    await save_examination(message, state)
+
+async def save_examination(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+
+    # Создаем новый объект обследования
+    new_exam = InstrumentalExamination(
+        telegram_id=message.from_user.id,
+        name=data["name"],
+        examination_date=data["date"],
+        description=data["description"],
+        file_path=data.get("file"),  # file_path теперь хранит путь к файлу
+        created_at=datetime.utcnow()
+    )
+
+    # Сохраняем в базе данных
+    async with async_session() as session:
+        session.add(new_exam)
+        await session.commit()
+
+    await message.answer("✅ Обследование успешно добавлено.")
+    await state.clear()
+# --------------- Посмотреть обследования -----------------
+@dp.message(F.text == "📋 Посмотреть обследования")
+async def view_examinations(message: types.Message):
+    await message.answer("🔄 Функция просмотра обследований в разработке.")
+
+# --------------- Редактировать обследование -----------------
+@dp.message(F.text == "✏️ Редактировать обследования")
+async def edit_examination(message: types.Message):
+    await message.answer("🔄 Функция редактирования обследований в разработке.")
+
+# --------------- Удалить обследование -----------------
+@dp.message(F.text == "❌ Удалить обследования")
+async def delete_examination(message: types.Message):
+    await message.answer("🔄 Функция удаления обследований в разработке.")         
 #------------------------------------------------------------------------------------------------------------------#
 # Запуск
 async def main():

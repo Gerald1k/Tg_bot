@@ -1,8 +1,9 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Text, Float, BigInteger, Date
+from sqlalchemy import Column, Integer, String, Text, Float, BigInteger, Date, DateTime
 from os import getenv
 from dotenv import load_dotenv
+from datetime import datetime
 import asyncio
 
 # Загрузка переменных окружения из .env
@@ -62,11 +63,43 @@ class AnalyzesMem(Base):
     name = Column(String(100), nullable=False)
     group_name = Column(String(100), nullable=False)
     unit = Column(String(50), nullable=False)
-    standard_unit = Column(String(50), nullable=False)            # Стандартная единица измерения
+    standard_unit = Column(String(50), nullable=False)
     reference_values = Column(String(100), nullable=False)
-    standard_reference = Column(String(100), nullable=False)      # Референсные значения в стандартной единице
-    conversion_to_standard = Column(Float, nullable=False)        # Коэффициент пересчета в стандартную ед.изм
+    standard_reference = Column(String(100), nullable=False)
+    conversion_to_standard = Column(Float, nullable=False)
+
+# Модель рекомендаций
+class Recommendation(Base):
+    __tablename__ = "recommendations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False)
+    category = Column(String(100), nullable=False)
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
     
+# Модель назначений врача
+class DoctorAppointment(Base):
+    __tablename__ = "doctor_appointments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False)
+    appointment_date = Column(Date, nullable=False)
+    doctor = Column(String(100), nullable=False)
+    recommendation = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+class InstrumentalExamination(Base):
+    __tablename__ = "instrumental_examinations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False)
+    examination_date = Column(Date, nullable=False)
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=False)
+    file_path = Column(Text)  # путь к загруженному файлу
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 # Функция для создания всех таблиц
 async def init_db():
     async with engine.begin() as conn:
